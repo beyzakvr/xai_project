@@ -16,9 +16,8 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler, LabelEncoder
 warnings.filterwarnings("ignore")
 
 
-# -------------------------
-# 1. Load data
-# -------------------------
+
+# First I load the data
 df = pd.read_csv("ai_skepticism_dataset.csv")
 target_col = "user_skepticism_category"
 
@@ -30,52 +29,22 @@ y_encoded = label_encoder.fit_transform(y)
 class_names = label_encoder.classes_.tolist()
 
 
-# -------------------------
-# 2. Column types
-# -------------------------
+# Deciding on the column types
 bool_cols = X.select_dtypes(include=["bool"]).columns.tolist()
 num_cols = X.select_dtypes(include=["int64", "float64"]).columns.tolist() + bool_cols
 cat_cols = X.select_dtypes(include=["object"]).columns.tolist()
 
+# Managing train-test split
+X_train, X_test, y_train, y_test = train_test_split(X, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded)
 
-# -------------------------
-# 3. Train-test split
-# -------------------------
-X_train, X_test, y_train, y_test = train_test_split(
-    X,
-    y_encoded,
-    test_size=0.2,
-    random_state=42,
-    stratify=y_encoded,
-)
+# Preprocessing
+numeric_transformer = Pipeline([("imputer", SimpleImputer(strategy="median")),("scaler", StandardScaler())])
+categorical_transformer = Pipeline([("imputer", SimpleImputer(strategy="most_frequent")),("onehot", OneHotEncoder(handle_unknown="ignore"))])
+preprocessor = ColumnTransformer([("num", numeric_transformer, num_cols), ("cat", categorical_transformer, cat_cols),])
 
 
-# -------------------------
-# 4. Preprocessing
-# -------------------------
-numeric_transformer = Pipeline([
-    ("imputer", SimpleImputer(strategy="median")),
-    ("scaler", StandardScaler()),
-])
-
-categorical_transformer = Pipeline([
-    ("imputer", SimpleImputer(strategy="most_frequent")),
-    ("onehot", OneHotEncoder(handle_unknown="ignore")),
-])
-
-preprocessor = ColumnTransformer([
-    ("num", numeric_transformer, num_cols),
-    ("cat", categorical_transformer, cat_cols),
-])
-
-
-# -------------------------
-# 5. Model
-# -------------------------
-rf_pipeline = Pipeline([
-    ("preprocessor", preprocessor),
-    ("classifier", RandomForestClassifier(n_estimators=200, random_state=42)),
-])
+# Modeling
+rf_pipeline = Pipeline([("preprocessor", preprocessor),("classifier", RandomForestClassifier(n_estimators=200, random_state=42))])
 
 rf_pipeline.fit(X_train, y_train)
 y_pred = rf_pipeline.predict(X_test)
@@ -84,19 +53,15 @@ print("Random Forest Accuracy:", round(accuracy_score(y_test, y_pred), 4))
 print("Random Forest Macro F1:", round(f1_score(y_test, y_pred, average="macro"), 4))
 
 
-# -------------------------
-# 6. Transform data for SHAP/LIME
-# -------------------------
+# Transforming data for SHAP and LIME
 fitted_preprocessor = rf_pipeline.named_steps["preprocessor"]
 rf_model = rf_pipeline.named_steps["classifier"]
 
 X_train_transformed = fitted_preprocessor.transform(X_train)
 X_test_transformed = fitted_preprocessor.transform(X_test)
 
-if hasattr(X_train_transformed, "toarray"):
-    X_train_transformed = X_train_transformed.toarray()
-if hasattr(X_test_transformed, "toarray"):
-    X_test_transformed = X_test_transformed.toarray()
+if hasattr(X_train_transformed, "toarray"): X_train_transformed = X_train_transformed.toarray()
+if hasattr(X_test_transformed, "toarray"): X_test_transformed = X_test_transformed.toarray()
 
 feature_names = fitted_preprocessor.get_feature_names_out()
 
@@ -104,14 +69,11 @@ X_train_transformed_df = pd.DataFrame(X_train_transformed, columns=feature_names
 X_test_transformed_df = pd.DataFrame(X_test_transformed, columns=feature_names)
 
 
-# -------------------------
-# 7. SHAP explanation
-# -------------------------
+# Implementing the SHAP explanation
 explainer = shap.TreeExplainer(rf_model)
 shap_values = explainer.shap_values(X_test_transformed_df)
 
-if isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
-    shap_values = [shap_values[:, :, i] for i in range(shap_values.shape[2])]
+if isinstance(shap_values, np.ndarray) and shap_values.ndim == 3: shap_values = [shap_values[:, :, i] for i in range(shap_values.shape[2])]
 
 pred_class = int(rf_model.predict(X_test_transformed_df.iloc[[0]])[0])
 
@@ -119,37 +81,19 @@ print("\nSample SHAP top features:")
 abs_vals = np.abs(shap_values[pred_class][0])
 top_idx = np.argsort(abs_vals)[-5:][::-1]
 for i in top_idx:
-    print(feature_names[i], "->", round(shap_values[pred_class][0][i], 4))
+     print(feature_names[i], "->", round(shap_values[pred_class][0][i], 4))
 
 plt.figure()
-shap.summary_plot(
-    shap_values[pred_class],
-    X_test_transformed_df,
-    feature_names=feature_names,
-    show=False,
-)
+shap.summary_plot( shap_values[pred_class], X_test_transformed_df, feature_names=feature_names, show=False)
 plt.tight_layout()
 plt.savefig("shap_summary.png", dpi=300, bbox_inches="tight")
 plt.close()
 
 
-# -------------------------
-# 8. LIME explanation
-# -------------------------
-lime_explainer = LimeTabularExplainer(
-    training_data=X_train_transformed_df.values,
-    feature_names=feature_names.tolist(),
-    class_names=class_names,
-    mode="classification",
-    discretize_continuous=True,
-    random_state=42,
-)
+# Implementing LIME explanation
+lime_explainer = LimeTabularExplainer( training_data=X_train_transformed_df.values, feature_names=feature_names.tolist(), class_names=class_names, mode="classification", discretize_continuous=True, random_state=42)
 
-lime_exp = lime_explainer.explain_instance(
-    data_row=X_test_transformed_df.iloc[0].values,
-    predict_fn=rf_model.predict_proba,
-    num_features=5,
-)
+lime_exp = lime_explainer.explain_instance(data_row=X_test_transformed_df.iloc[0].values, predict_fn=rf_model.predict_proba, num_features=5)
 
 print("\nSample LIME explanation:")
 for item in lime_exp.as_list():
@@ -158,9 +102,7 @@ for item in lime_exp.as_list():
 lime_exp.save_to_file("lime_explanation.html")
 
 
-# -------------------------
-# 9. Faithfulness
-# -------------------------
+# 9. Function for the faithfulness score
 def faithfulness_score(model, x_instance, important_indices):
     original_probs = model.predict_proba(x_instance.reshape(1, -1))[0]
     original_class = int(np.argmax(original_probs))
@@ -187,9 +129,7 @@ for i in range(min(20, len(X_test_transformed_df))):
 print("\nAverage SHAP faithfulness:", round(float(np.mean(shap_faithfulness)), 4))
 
 
-# -------------------------
-# 10. Stability
-# -------------------------
+# Stability
 def add_small_noise(x, noise_std=0.01):
     return x + np.random.normal(0, noise_std, size=x.shape)
 
