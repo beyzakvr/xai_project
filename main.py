@@ -60,8 +60,10 @@ rf_model = rf_pipeline.named_steps["classifier"]
 X_train_transformed = fitted_preprocessor.transform(X_train)
 X_test_transformed = fitted_preprocessor.transform(X_test)
 
-if hasattr(X_train_transformed, "toarray"): X_train_transformed = X_train_transformed.toarray()
-if hasattr(X_test_transformed, "toarray"): X_test_transformed = X_test_transformed.toarray()
+if hasattr(X_train_transformed, "toarray"): 
+    X_train_transformed = X_train_transformed.toarray()
+if hasattr(X_test_transformed, "toarray"): 
+    X_test_transformed = X_test_transformed.toarray()
 
 feature_names = fitted_preprocessor.get_feature_names_out()
 
