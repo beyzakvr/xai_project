@@ -102,7 +102,6 @@ The explanation methods were evaluated using multiple complementary metrics:
 The project generates the following outputs:
 
 - `shap_summary.png` → global SHAP importance
-- `lime_explanation.html` → local LIME explanation
 - `xai_comparison.png` → SHAP vs LIME comparison
 - `mcd_concept_analysis.png` → concept relevance and completeness distribution
 
@@ -127,7 +126,6 @@ Final Project/
 ├── requirements.txt
 ├── README.md
 ├── shap_summary.png
-├── lime_explanation.html
 ├── xai_comparison.png
 ├── mcd_concept_analysis.png
 ```

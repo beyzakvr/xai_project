@@ -101,7 +101,6 @@ print("\nSample LIME explanation:")
 for item in lime_exp.as_list():
     print(item)
 
-lime_exp.save_to_file("lime_explanation.html")
 
 
 # Function for the faithfulness score
