@@ -11,6 +11,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 from scipy.spatial.distance import cosine
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import train_test_split
@@ -18,7 +19,6 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, LabelEncoder
 
 warnings.filterwarnings("ignore")
-
 
 
 # First I load the data
@@ -31,7 +31,6 @@ y = df[target_col]
 label_encoder = LabelEncoder()
 y_encoded = label_encoder.fit_transform(y)
 class_names = label_encoder.classes_.tolist()
-
 
 # Deciding on the column types
 bool_cols = X.select_dtypes(include=["bool"]).columns.tolist()
@@ -46,7 +45,6 @@ numeric_transformer = Pipeline([("imputer", SimpleImputer(strategy="median")),("
 categorical_transformer = Pipeline([("imputer", SimpleImputer(strategy="most_frequent")),("onehot", OneHotEncoder(handle_unknown="ignore"))])
 preprocessor = ColumnTransformer([("num", numeric_transformer, num_cols), ("cat", categorical_transformer, cat_cols),])
 
-
 # Modeling
 rf_pipeline = Pipeline([("preprocessor", preprocessor),("classifier", RandomForestClassifier(n_estimators=200, random_state=42))])
 
@@ -55,7 +53,6 @@ y_pred = rf_pipeline.predict(X_test)
 
 print("Random Forest Accuracy:", round(accuracy_score(y_test, y_pred), 4))
 print("Random Forest Macro F1:", round(f1_score(y_test, y_pred, average="macro"), 4))
-
 
 # Transforming data for SHAP and LIME
 fitted_preprocessor = rf_pipeline.named_steps["preprocessor"]
@@ -73,7 +70,6 @@ feature_names = fitted_preprocessor.get_feature_names_out()
 
 X_train_transformed_df = pd.DataFrame(X_train_transformed, columns=feature_names)
 X_test_transformed_df = pd.DataFrame(X_test_transformed, columns=feature_names)
-
 
 # Implementing the SHAP explanation
 explainer = shap.TreeExplainer(rf_model)
@@ -254,26 +250,6 @@ for i in range(min(20, len(X_test_transformed_df))):
  
 print("Average SHAP additivity error:", round(float(np.mean(additivity_errors)), 6))
  
- 
-# MCD-inspired concept completeness
-shap_attr = np.array([np.abs(shap_values[int(rf_model.predict(X_test_transformed_df.iloc[[i]])[0])][i])
-                      for i in range(len(X_test_transformed_df))])
-pca           = PCA(n_components=len(class_names), random_state=42)
-shap_pc       = pca.fit_transform(shap_attr)
-cluster_labels = KMeans(n_clusters=len(class_names), random_state=42, n_init=10).fit_predict(shap_pc)
- 
-def cluster_coherence(X_proj, labels):
-    scores = []
-    for c in np.unique(labels):
-        members = X_proj[labels == c]
-        sims = [1 - cosine(members[a], members[b]) for a in range(len(members)) for b in range(a+1, min(a+10, len(members)))]
-        if sims: scores.append(np.mean(sims))
-    return float(np.mean(scores)) if scores else 0.0
- 
-print("PCA variance explained:", round(float(np.sum(pca.explained_variance_ratio_)), 4))
-print("Concept cluster coherence:", round(cluster_coherence(shap_pc, cluster_labels), 4))
- 
- 
 # Summary table for comparison
 results = pd.DataFrame({
     "Method": ["SHAP", "LIME"],
@@ -298,3 +274,74 @@ plt.suptitle("SHAP vs LIME across evaluation dimensions", fontsize=11)
 plt.tight_layout()
 plt.savefig("xai_comparison.png", dpi=150, bbox_inches="tight")
 plt.close()
+
+
+# Implementing Multi-dimensional concept discovery (MCD) 
+
+N_CONCEPTS = len(class_names)
+
+# Leaf embeddings
+leaf_train = rf_model.apply(X_train_transformed_df.values).astype(float)
+leaf_test  = rf_model.apply(X_test_transformed_df.values).astype(float)
+
+leaf_train_s = StandardScaler().fit_transform(leaf_train)
+leaf_test_s  = StandardScaler().fit(leaf_train).transform(leaf_test)
+
+# Clustering
+clusters = KMeans(n_clusters=N_CONCEPTS, random_state=42, n_init=10).fit_predict(leaf_train_s)
+
+# Build concept bases (PCA per cluster)
+def build_concepts(X, labels):
+    bases, dims = {}, {}
+    for c in range(N_CONCEPTS):
+        members = X[labels == c]
+        if len(members) < 2:
+            bases[c], dims[c] = None, 0
+            continue
+        pca = PCA(random_state=42).fit(members)
+        d = np.searchsorted(np.cumsum(pca.explained_variance_ratio_), 0.9) + 1
+        bases[c] = PCA(n_components=min(d, members.shape[1]), random_state=42).fit(members)
+        dims[c] = bases[c].n_components_
+    return bases, dims
+
+concept_bases, concept_dims = build_concepts(leaf_train_s, clusters)
+
+print("MCD concept subspace dimensions:")
+for c in range(N_CONCEPTS):
+    print(f"  {class_names[c]}: d={concept_dims[c]}")
+
+# Projection helper
+project = lambda v, p: np.zeros_like(v) if p is None else p.components_.T @ (p.components_ @ v)
+
+# Completeness + relevance
+scores, rels = [], []
+for v in leaf_test_s:
+    norm = v @ v
+    if norm == 0:
+        scores.append(0); rels.append([0]*N_CONCEPTS); continue
+    proj_vals = [float((p:=project(v, concept_bases[c])) @ p) for c in range(N_CONCEPTS)]
+    scores.append(sum(proj_vals) / norm)
+    rels.append([pv / norm for pv in proj_vals])
+
+mcd_completeness = float(np.mean(scores))
+mean_rel = np.mean(rels, axis=0)
+
+print(f"\nMCD completeness (η): {round(mcd_completeness, 4)}")
+for c in range(N_CONCEPTS):
+    print(f"  {class_names[c]}: {round(float(mean_rel[c]), 4)}")
+
+# Plot
+fig, ax = plt.subplots(1, 2, figsize=(12, 4))
+
+ax[0].bar(class_names, mean_rel)
+ax[0].set_title("Concept relevance")
+
+ax[1].hist(scores, bins=20)
+ax[1].axvline(mcd_completeness, linestyle="--", color="red")
+ax[1].set_title("Completeness distribution")
+
+plt.tight_layout()
+plt.savefig("mcd_concept_analysis.png", dpi=150)
+plt.close()
+
+print("Saved: mcd_concept_analysis.png")
