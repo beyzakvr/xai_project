@@ -8,6 +8,10 @@ from lime.lime_tabular import LimeTabularExplainer
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from scipy.spatial.distance import cosine
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
@@ -104,7 +108,7 @@ for item in lime_exp.as_list():
 lime_exp.save_to_file("lime_explanation.html")
 
 
-# 9. Function for the faithfulness score
+# Function for the faithfulness score
 def faithfulness_score(model, x_instance, important_indices):
     original_probs = model.predict_proba(x_instance.reshape(1, -1))[0]
     original_class = int(np.argmax(original_probs))
@@ -112,7 +116,7 @@ def faithfulness_score(model, x_instance, important_indices):
 
     x_modified = x_instance.copy()
     for idx in important_indices:
-        x_modified[idx] = 0
+        x_modified[idx] = 0 # Neutralize the top-k most important SHAP features by setting them to 0.
 
     new_probs = model.predict_proba(x_modified.reshape(1, -1))[0]
     new_conf = float(new_probs[original_class])
@@ -163,3 +167,134 @@ for i in range(min(20, len(X_test_transformed_df))):
         shap_stability.append(corr)
 
 print("Average SHAP stability:", round(float(np.mean(shap_stability)), 4))
+
+lr_pipeline = Pipeline([("preprocessor", preprocessor), ("classifier", LogisticRegression(max_iter=1000, random_state=42))])
+lr_pipeline.fit(X_train, y_train)
+y_pred_lr = lr_pipeline.predict(X_test)
+print("Logistic Regression Accuracy:", round(accuracy_score(y_test, y_pred_lr), 4))
+print("Logistic Regression Macro F1:", round(f1_score(y_test, y_pred_lr, average="macro"), 4))
+ 
+ 
+# Helper: dense LIME weight vector aligned to feature indices
+def lime_weight_vector(lime_exp, n_features):
+    weight_map = dict(lime_exp.as_map()[lime_exp.available_labels()[0]])
+    vec = np.zeros(n_features)
+    for idx, w in weight_map.items():
+        vec[idx] = w
+    return vec
+ 
+ 
+# Faithfulness — insertion test (complement to deletion already implemented above)
+def faithfulness_insertion(model, x_instance, important_indices):
+    orig_class = int(np.argmax(model.predict_proba(x_instance.reshape(1, -1))[0]))
+    x_restored = np.zeros_like(x_instance)
+    for idx in important_indices:
+        x_restored[idx] = x_instance[idx]
+    restored_conf = float(model.predict_proba(x_restored.reshape(1, -1))[0][orig_class])
+    baseline_conf = float(model.predict_proba(np.zeros_like(x_instance).reshape(1, -1))[0][orig_class])
+    return restored_conf - baseline_conf
+ 
+ 
+# F-Fidelity (marginal baseline instead of zeros to avoid out-of-distribution artifacts)
+feature_means = X_train_transformed_df.mean().values.copy()
+feature_stds  = X_train_transformed_df.std().values.copy()
+feature_stds[feature_stds == 0] = 1e-8
+ 
+def f_fidelity(model, x_instance, important_indices, B=10):
+    orig_probs = model.predict_proba(x_instance.reshape(1, -1))[0]
+    orig_class = int(np.argmax(orig_probs))
+    drops = []
+    for _ in range(B):
+        x_mod = x_instance.copy()
+        for idx in important_indices:
+            x_mod[idx] = np.random.normal(feature_means[idx], feature_stds[idx])
+        drops.append(float(orig_probs[orig_class]) - float(model.predict_proba(x_mod.reshape(1, -1))[0][orig_class]))
+    return float(np.mean(drops))
+ 
+ 
+# Evaluating all metrics for SHAP and LIME
+shap_ins, lime_del, lime_ins, shap_ff, lime_ff, lime_stability = [], [], [], [], [], []
+ 
+for i in range(min(20, len(X_test_transformed_df))):
+    x_val      = X_test_transformed_df.iloc[i].values
+    pred_class = int(rf_model.predict(x_val.reshape(1, -1))[0])
+    n_feat     = len(feature_names)
+ 
+    shap_top = np.argsort(np.abs(shap_values[pred_class][i]))[-3:][::-1]
+    shap_ins.append(faithfulness_insertion(rf_model, x_val, shap_top))
+    shap_ff.append(f_fidelity(rf_model, x_val, shap_top))
+ 
+    lime_exp = lime_explainer.explain_instance(x_val, rf_model.predict_proba, num_features=3, labels=(pred_class,))
+    lime_top = np.argsort(np.abs(lime_weight_vector(lime_exp, n_feat)))[-3:][::-1]
+    lime_del.append(faithfulness_score(rf_model, x_val, lime_top))
+    lime_ins.append(faithfulness_insertion(rf_model, x_val, lime_top))
+    lime_ff.append(f_fidelity(rf_model, x_val, lime_top))
+ 
+    # LIME stability
+    x_noisy   = add_small_noise(x_val)
+    le_orig   = lime_explainer.explain_instance(x_val,   rf_model.predict_proba, num_features=n_feat, labels=(pred_class,))
+    pc_noisy  = int(rf_model.predict(x_noisy.reshape(1, -1))[0])
+    le_noisy  = lime_explainer.explain_instance(x_noisy, rf_model.predict_proba, num_features=n_feat, labels=(pc_noisy,))
+    corr, _   = spearmanr(np.abs(lime_weight_vector(le_orig, n_feat)), np.abs(lime_weight_vector(le_noisy, n_feat)))
+    if not np.isnan(corr):
+        lime_stability.append(corr)
+ 
+ 
+# SHAP additivity check
+additivity_errors = []
+for i in range(min(20, len(X_test_transformed_df))):
+    x_val      = X_test_transformed_df.iloc[[i]]
+    pred_class = int(rf_model.predict(x_val)[0])
+    sv_i = explainer.shap_values(x_val)
+    if isinstance(sv_i, np.ndarray) and sv_i.ndim == 3:
+        sv_i = [sv_i[:, :, j] for j in range(sv_i.shape[2])]
+    ev      = float(explainer.expected_value[pred_class]) if hasattr(explainer.expected_value, "__len__") else float(explainer.expected_value)
+    f_x     = float(rf_model.predict_proba(x_val)[0][pred_class])
+    additivity_errors.append(abs(np.sum(sv_i[pred_class][0]) + ev - f_x))
+ 
+print("Average SHAP additivity error:", round(float(np.mean(additivity_errors)), 6))
+ 
+ 
+# MCD-inspired concept completeness
+shap_attr = np.array([np.abs(shap_values[int(rf_model.predict(X_test_transformed_df.iloc[[i]])[0])][i])
+                      for i in range(len(X_test_transformed_df))])
+pca           = PCA(n_components=len(class_names), random_state=42)
+shap_pc       = pca.fit_transform(shap_attr)
+cluster_labels = KMeans(n_clusters=len(class_names), random_state=42, n_init=10).fit_predict(shap_pc)
+ 
+def cluster_coherence(X_proj, labels):
+    scores = []
+    for c in np.unique(labels):
+        members = X_proj[labels == c]
+        sims = [1 - cosine(members[a], members[b]) for a in range(len(members)) for b in range(a+1, min(a+10, len(members)))]
+        if sims: scores.append(np.mean(sims))
+    return float(np.mean(scores)) if scores else 0.0
+ 
+print("PCA variance explained:", round(float(np.sum(pca.explained_variance_ratio_)), 4))
+print("Concept cluster coherence:", round(cluster_coherence(shap_pc, cluster_labels), 4))
+ 
+ 
+# Summary table for comparison
+results = pd.DataFrame({
+    "Method": ["SHAP", "LIME"],
+    "Faithfulness (deletion)":  [round(float(np.mean(shap_faithfulness)), 4), round(float(np.mean(lime_del)), 4)],
+    "Faithfulness (insertion)": [round(float(np.mean(shap_ins)), 4),          round(float(np.mean(lime_ins)), 4)],
+    "F-Fidelity":               [round(float(np.mean(shap_ff)), 4),           round(float(np.mean(lime_ff)), 4)],
+    "Stability (Spearman)":     [round(float(np.mean(shap_stability)), 4),    round(float(np.mean(lime_stability)), 4)],
+}).set_index("Method")
+
+ 
+# Comparison bar chart
+fig, axes = plt.subplots(1, 4, figsize=(14, 4))
+for ax, (col, color) in zip(axes, zip(results.columns, ["#4C72B0", "#4C72B0", "#4C72B0", "#4C72B0"])):
+    vals = results[col].values
+    bars = ax.bar(results.index, vals, color=["#4C72B0", "#DD8452"], width=0.45)
+    ax.set_title(col, fontsize=9)
+    ax.set_ylim(0, max(vals) * 1.4 if max(vals) > 0 else 1)
+    for bar, v in zip(bars, vals):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005, f"{v:.3f}", ha="center", fontsize=9)
+    ax.spines[["top", "right"]].set_visible(False)
+plt.suptitle("SHAP vs LIME across evaluation dimensions", fontsize=11)
+plt.tight_layout()
+plt.savefig("xai_comparison.png", dpi=150, bbox_inches="tight")
+plt.close()
